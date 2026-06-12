@@ -1,1 +1,12 @@
 streamlit
+numpy
+pandas
+scikit-learn
+xgboost
+optuna
+shap
+Boruta
+joblib
+matplotlib
+scipy
+openpyxl

@@ -256,12 +256,28 @@ def train_and_export(args: argparse.Namespace) -> Path:
     y_data = convert_to_y(dass_ec3, dass_x_full["MolWeight"].values)
     y_reconverted = convert_to_ec3(y_data, dass_x_full["MolWeight"].values)
     y_label = np.array([llna_label(v, 2) for v in y_reconverted], dtype=int)
-
     selected_mask = fit_global_boruta(
         x_full=dass_x_full,
         y_data=y_data,
         boruta_perc=args.boruta_perc,
     )
+
+    # Notebook版と特徴量集合を一致させる
+    if "FM percent reacted" in dass_x_full.columns:
+        idx = list(dass_x_full.columns).index("FM percent reacted")
+        selected_mask[idx] = False
+
+    selected_columns = [
+        c for c, flag in zip(dass_x_full.columns, selected_mask)
+        if bool(flag)
+    ]
+
+    print("\n=== Selected Features ===")
+    print(f"Count: {len(selected_columns)}")
+    for col in selected_columns:
+        print(col)
+    print("=========================\n")
+    
 
     config = {
         "Data_split_random_state": args.random_state,
