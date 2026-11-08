@@ -1,451 +1,2094 @@
+# -*- coding: utf-8 -*-
+"""
+Notebook再現用 学習スクリプト（EC3最小fold採用版）
+
+主な仕様
+- KNNImputer + StandardScaler
+- Boruta または Notebook固定特徴量
+- XGBoost + 任意のOptunaチューニング
+- Stratified 5-fold CV
+- 外部検証(newCE)は「各行で予測EC3が最小のfold」を代表foldとして採用
+- k-NN ADを考慮する場合は「AD内foldのうち予測EC3が最小」を採用
+- SHAP保存
+- Streamlit/runtime用 artifact(joblib) 保存
+
+例:
+    python train.py \
+      --train-csv DASS_join_data_opera_delete_LLNAnan.csv \
+      --exval-csv newCE_join_data_opera_delete_LLNAnan_duplicate_plus_manual.csv \
+      --artifact-path artifacts/original_model_artifact.joblib \
+      --output-dir outputs \
+      --feature-mode fixed \
+      --ad-coverage 0.1
+"""
 from __future__ import annotations
 
-"""
-train.py テンプレート
-
-目的:
-- 提供Notebookの "best_xgbmodel 構築パス" をヘッドレスで再現する
-- そのうえで、アプリ推論用の安定アーティファクトを保存する
-
-前提 / 仮定:
-- DASS CSV は Notebook と同じ列構成
-- 外部検証(newCE)も Notebook と同じ構成で渡す
-- Notebook全体の探索セルは再現せず、best_xgbmodel を作る本線だけ再現する
-- SHAP は Notebookと同様に summary_plot を保存する
-"""
-
 import argparse
-import copy
-import math
-from datetime import datetime, timezone
+import json
+import os
+from copy import deepcopy
 from pathlib import Path
-from typing import Any
 
 import joblib
-import matplotlib.pyplot as plt
 import numpy as np
-import optuna
 import pandas as pd
-import shap
-from boruta import BorutaPy
-from optuna.samplers import TPESampler
-from scipy.spatial.distance import cdist
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.impute import KNNImputer
-from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.model_selection import StratifiedKFold
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from xgboost import XGBRegressor
+
+from utils_io import (
+    MW_COL,
+    NOTEBOOK_SELECTED_FEATURE_COLUMNS,
+    TARGET_COLUMN_DEFAULT,
+    ensure_dir,
+    load_dataset,
+    save_json,
+)
+
+from utils_ml import (
+    NOTEBOOK_XGB_BASE_PARAMS,
+    build_notebook_style_test_output,
+    clone_and_transform,
+    compute_knn_ad,
+    convert_ec3_to_y,
+    convert_y_to_ec3,
+    extract_invitro_calls,
+    fit_global_boruta,
+    make_llna_labels,
+    make_preprocess_pipeline,
+    optimize_xgb_params,
+    save_shap_artifacts_for_fold,
+    valid_regression_metrics,
+    _fit_model,
+)
 
 
-DEFAULT_XGB_PARAMS = {
-    "max_depth": 6,
-    "learning_rate": 0.03,
-    "n_estimators": 100000,
-    "verbosity": 1,
-    "booster": "gbtree",
-    "n_jobs": 1,
-    "gamma": 0,
-    "min_child_weight": 1,
-    "max_delta_step": 0,
-    "subsample": 1,
-    "colsample_bytree": 1,
-    "colsample_bylevel": 1,
-    "colsample_bynode": 1,
-    "reg_alpha": 0.5,
-    "reg_lambda": 0.1,
-    "scale_pos_weight": 1,
-    "base_score": None,
-    "random_state": 0,
-    "missing": float("nan"),
-    "objective": "reg:squarederror",
-    "eval_metric": "rmse",
-    "early_stopping_rounds": 15,
-}
+TARGET_OUTPUT_COL = "LLNA EC3(NS converted to 150%)"
+META_COLUMNS = ("No.", "Name", "CAS Number", "SMILES")
 
 
-def convert_to_y(ec3: pd.Series | np.ndarray, mw: np.ndarray) -> np.ndarray:
-    return np.log10(np.asarray(mw, dtype=float) / np.asarray(ec3, dtype=float))
+def _as_1d_float(
+    values,
+    *,
+    name: str,
+    expected_len: int | None = None,
+) -> np.ndarray:
+    """値を1次元float配列へ安全に変換する。"""
+    arr = np.asarray(values, dtype=float).reshape(-1)
+
+    if expected_len is not None and len(arr) != expected_len:
+        raise ValueError(
+            f"{name} の行数が不正です: "
+            f"expected={expected_len}, actual={len(arr)}"
+        )
+
+    return arr
 
 
-def convert_to_ec3(y: np.ndarray, mw: np.ndarray) -> np.ndarray:
-    return np.asarray(mw, dtype=float) / (10.0 ** np.asarray(y, dtype=float))
-
-
-def llna_label(ec3: float, num: float = 2.0) -> int:
-    if ec3 == 150:
-        return 0
-    if ec3 <= num:
-        return 2
-    return 1
-
-
-def read_project_csv(path: str | Path, encoding: str = "cp932") -> pd.DataFrame:
-    return pd.read_csv(path, encoding=encoding)
-
-
-def split_notebook_style(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
+def _validate_molecular_weight(
+    frame: pd.DataFrame,
+    *,
+    dataset_name: str,
+) -> np.ndarray:
     """
-    Notebook と同じ分割:
-    - 最後の列: y (LLNA_EC3)
-    - 先頭6列は識別列
-    - 7列目以降〜最後の1列手前: X
+    EC3逆変換に必要なMolWeightを検証する。
+    欠損・非数値・0以下は許可しない。
     """
-    name_mw_x = df.iloc[:, :-1]
-    y = df.iloc[:, -1]
-    x = name_mw_x.iloc[:, 6:]
-    return name_mw_x, x, y
+    if MW_COL not in frame.columns:
+        raise KeyError(
+            f"{dataset_name} に {MW_COL} 列がありません。"
+        )
+
+    mw = pd.to_numeric(
+        frame[MW_COL],
+        errors="coerce",
+    ).to_numpy(dtype=float)
+
+    invalid = ~np.isfinite(mw) | (mw <= 0)
+
+    if invalid.any():
+        rows = np.flatnonzero(invalid)[:10].tolist()
+
+        raise ValueError(
+            f"{dataset_name} の {MW_COL} に"
+            f"欠損・非数値・0以下があります。"
+            f" 該当行(先頭10件): {rows}"
+        )
+
+    return mw
 
 
-def make_pipeline() -> Pipeline:
-    return Pipeline(
-        [
-            ("inputer", KNNImputer(n_neighbors=5, weights="uniform")),
-            ("standarization", StandardScaler()),
+def _safe_ratio(
+    numerator: pd.Series,
+    denominator: pd.Series,
+) -> pd.Series:
+    """
+    Notebook形式の Fold_misprediction:
+        predicted_EC3 / true_EC3
+    """
+    num = pd.to_numeric(
+        numerator,
+        errors="coerce",
+    )
+
+    den = pd.to_numeric(
+        denominator,
+        errors="coerce",
+    )
+
+    with np.errstate(
+        divide="ignore",
+        invalid="ignore",
+    ):
+        out = num / den
+
+    return out.replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
+
+
+def _select_min_ec3_fold(
+    pred_y_fold: pd.DataFrame,
+    pred_ec3_fold: pd.DataFrame,
+    *,
+    eligibility: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """
+    各行で Predict_LLNA EC3 が最小のfoldを選ぶ。
+
+    eligibility が指定された場合:
+        True のfoldだけを候補にする。
+
+    重要:
+        EC3だけmin()してpred_yを別foldから取るのではなく、
+        EC3が最小になった「同じfold」のpred_yを採用する。
+    """
+
+    if pred_ec3_fold.empty:
+        raise ValueError(
+            "fold予測が0列です。"
+        )
+
+    columns = list(
+        pred_ec3_fold.columns
+    )
+
+    if list(pred_y_fold.columns) != columns:
+        raise ValueError(
+            "pred_y_fold と pred_ec3_fold の"
+            "fold列が一致していません。"
+        )
+
+    if len(pred_y_fold) != len(pred_ec3_fold):
+        raise ValueError(
+            "pred_y_fold と pred_ec3_fold の"
+            "行数が一致していません。"
+        )
+
+    y_values = (
+        pred_y_fold
+        .apply(
+            pd.to_numeric,
+            errors="coerce",
+        )
+        .to_numpy(dtype=float)
+    )
+
+    ec3_values = (
+        pred_ec3_fold
+        .apply(
+            pd.to_numeric,
+            errors="coerce",
+        )
+        .to_numpy(dtype=float)
+    )
+
+    valid = (
+        np.isfinite(y_values)
+        & np.isfinite(ec3_values)
+        & (ec3_values > 0)
+    )
+
+    if eligibility is not None:
+
+        eligibility = eligibility.reindex(
+            index=pred_ec3_fold.index,
+            columns=columns,
+        )
+
+        eligible_values = (
+            eligibility
+            .fillna(False)
+            .astype(bool)
+            .to_numpy(dtype=bool)
+        )
+
+        valid &= eligible_values
+
+    # 無効値は inf にして
+    # argmin の候補から外す
+    safe_ec3 = np.where(
+        valid,
+        ec3_values,
+        np.inf,
+    )
+
+    chosen_idx = np.argmin(
+        safe_ec3,
+        axis=1,
+    )
+
+    has_candidate = valid.any(
+        axis=1
+    )
+
+    row_idx = np.arange(
+        len(pred_ec3_fold)
+    )
+
+    chosen_y = np.full(
+        len(pred_ec3_fold),
+        np.nan,
+        dtype=float,
+    )
+
+    chosen_ec3 = np.full(
+        len(pred_ec3_fold),
+        np.nan,
+        dtype=float,
+    )
+
+    chosen_fold = np.full(
+        len(pred_ec3_fold),
+        None,
+        dtype=object,
+    )
+
+    chosen_y[has_candidate] = y_values[
+        row_idx[has_candidate],
+        chosen_idx[has_candidate],
+    ]
+
+    chosen_ec3[has_candidate] = ec3_values[
+        row_idx[has_candidate],
+        chosen_idx[has_candidate],
+    ]
+
+    col_array = np.asarray(
+        columns,
+        dtype=object,
+    )
+
+    chosen_fold[has_candidate] = col_array[
+        chosen_idx[has_candidate]
+    ]
+
+    return pd.DataFrame(
+        {
+            "selected_fold": chosen_fold,
+            "selected_fold_index": np.where(
+                has_candidate,
+                chosen_idx,
+                -1,
+            ),
+            "pred_y": chosen_y,
+            "pred_ec3": chosen_ec3,
+            "has_candidate": has_candidate,
+        },
+        index=pred_ec3_fold.index,
+    )
+
+
+def _selected_bool_from_fold(
+    bool_fold: pd.DataFrame,
+    selection: pd.DataFrame,
+) -> np.ndarray:
+    """
+    選択されたfoldに対応する
+    AD bool値を取り出す。
+    """
+
+    values = (
+        bool_fold
+        .fillna(False)
+        .astype(bool)
+        .to_numpy(dtype=bool)
+    )
+
+    idx = selection[
+        "selected_fold_index"
+    ].to_numpy(dtype=int)
+
+    has = selection[
+        "has_candidate"
+    ].to_numpy(dtype=bool)
+
+    rows = np.arange(
+        len(bool_fold)
+    )
+
+    out = np.zeros(
+        len(bool_fold),
+        dtype=bool,
+    )
+
+    out[has] = values[
+        rows[has],
+        idx[has],
+    ]
+
+    return out
+
+
+def _build_min_ec3_exval_output(
+    *,
+    meta_df: pd.DataFrame,
+    y_true: np.ndarray,
+    y_true_ec3: np.ndarray,
+    pred_y_fold: pd.DataFrame,
+    pred_ec3_fold: pd.DataFrame,
+    knn_ad_fold: pd.DataFrame,
+    X_original: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    外部検証結果を
+    「EC3最小fold」の規則で作成する。
+    """
+
+    n = len(
+        pred_ec3_fold
+    )
+
+    y_true = _as_1d_float(
+        y_true,
+        name="y_true",
+        expected_len=n,
+    )
+
+    y_true_ec3 = _as_1d_float(
+        y_true_ec3,
+        name="y_true_ec3",
+        expected_len=n,
+    )
+
+    out = pd.DataFrame(
+        index=np.arange(n)
+    )
+
+    meta_cols = [
+        c
+        for c in META_COLUMNS
+        if c in meta_df.columns
+    ]
+
+    if meta_cols:
+        out = pd.concat(
+            [
+                meta_df[
+                    meta_cols
+                ].reset_index(drop=True),
+                out,
+            ],
+            axis=1,
+        )
+
+    out["true_y"] = y_true
+
+    out[
+        TARGET_OUTPUT_COL
+    ] = y_true_ec3
+
+    # ==================================================
+    # 全foldからEC3最小foldを選択
+    # ==================================================
+    selected = _select_min_ec3_fold(
+        pred_y_fold,
+        pred_ec3_fold,
+    )
+
+    out["selected_fold"] = (
+        selected[
+            "selected_fold"
         ]
+        .reset_index(drop=True)
     )
 
+    out["pred_y"] = selected[
+        "pred_y"
+    ].to_numpy(dtype=float)
 
-def fit_global_boruta(
-    x_full: pd.DataFrame,
-    y_data: np.ndarray,
-    boruta_perc: int,
-) -> np.ndarray:
-    pipe = make_pipeline()
-    x_pre = pipe.fit_transform(x_full)
+    out["Predict_LLNA EC3"] = selected[
+        "pred_ec3"
+    ].to_numpy(dtype=float)
 
-    rf = RandomForestRegressor(n_jobs=-1, max_depth=5)
-    boruta = BorutaPy(
-        rf,
-        n_estimators="auto",
-        verbose=0,
-        random_state=0,
-        perc=boruta_perc,
+    out["Fold_misprediction"] = _safe_ratio(
+        out["Predict_LLNA EC3"],
+        out[TARGET_OUTPUT_COL],
     )
-    boruta.fit(x_pre, y_data)
-    return np.asarray(boruta.support_, dtype=bool)
 
-
-def optuna_tune_xgb(
-    x_train_selected: np.ndarray,
-    y_train: np.ndarray,
-    y_train_label: np.ndarray,
-    n_trials: int,
-) -> dict[str, Any]:
-    best_iterators_list: list[list[int]] = []
-
-    def objective(trial: optuna.Trial) -> float:
-        search_params = {
-            "max_depth": trial.suggest_int("max_depth", 3, 9),
-            "gamma": trial.suggest_float("gamma", 1e-8, 1.0, log=True),
-            "min_child_weight": trial.suggest_int("min_child_weight", 2, 10),
-            "subsample": trial.suggest_float("subsample", 0.2, 1.0),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.2, 1.0),
-            "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 1.0, log=True),
-            "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 1.0, log=True),
-        }
-
-        params = {**DEFAULT_XGB_PARAMS, **search_params}
-        xgb = XGBRegressor(**params)
-
-        inner_skf = StratifiedKFold(n_splits=5, random_state=0, shuffle=True)
-        cv_scores: list[float] = []
-        inner_best_iterations: list[int] = []
-
-        for in_tr_idx, val_idx in inner_skf.split(x_train_selected, y_train_label):
-            x_tr = x_train_selected[in_tr_idx]
-            x_val = x_train_selected[val_idx]
-            y_tr = y_train[in_tr_idx]
-            y_val = y_train[val_idx]
-
-            xgb.fit(x_tr, y_tr, eval_set=[(x_val, y_val)], verbose=0)
-
-            y_val_pred = xgb.predict(x_val)
-            inner_best_iterations.append(int(xgb.best_iteration))
-            cv_scores.append(float(r2_score(y_val, y_val_pred)))
-
-        best_iterators_list.append(inner_best_iterations)
-        return float(np.mean(cv_scores))
-
-    study = optuna.create_study(
-        sampler=TPESampler(seed=0),
-        direction="maximize",
+    # 選択された代表foldがAD内か
+    out["kNN_AD"] = _selected_bool_from_fold(
+        knn_ad_fold,
+        selected,
     )
-    study.optimize(objective, n_trials=n_trials)
 
-    best_params = {**DEFAULT_XGB_PARAMS, **study.best_params}
-    best_params["n_estimators"] = max(best_iterators_list[study.best_trial.number])
-    del best_params["early_stopping_rounds"]
+    # 5fold中1つでもAD内ならTrue
+    out["any_kNN_AD"] = (
+        knn_ad_fold
+        .fillna(False)
+        .astype(bool)
+        .any(axis=1)
+        .to_numpy()
+    )
 
-    return {
-        "best_params": best_params,
-        "study": study,
-        "best_iterators_list": best_iterators_list,
-    }
+    # ==================================================
+    # k-NN AD内のfoldだけから
+    # EC3最小foldを選択
+    # ==================================================
+    selected_in_ad = _select_min_ec3_fold(
+        pred_y_fold,
+        pred_ec3_fold,
+        eligibility=knn_ad_fold,
+    )
+
+    out["knn_inAD_selected_fold"] = (
+        selected_in_ad[
+            "selected_fold"
+        ]
+        .reset_index(drop=True)
+    )
+
+    out["knn_inAD_pred_y"] = (
+        selected_in_ad[
+            "pred_y"
+        ]
+        .to_numpy(dtype=float)
+    )
+
+    out[
+        "knn_inAD_Predict_LLNA EC3"
+    ] = (
+        selected_in_ad[
+            "pred_ec3"
+        ]
+        .to_numpy(dtype=float)
+    )
+
+    out[
+        "knn_inAD_Fold_misprediction"
+    ] = _safe_ratio(
+        out[
+            "knn_inAD_Predict_LLNA EC3"
+        ],
+        out[TARGET_OUTPUT_COL],
+    )
+
+    # ==================================================
+    # in vitro AD
+    # ==================================================
+    try:
+        invitro_df = extract_invitro_calls(
+            X_original
+        )
+
+        out["invitro_AD"] = (
+            invitro_df[
+                "invitro_AD"
+            ]
+            .reset_index(drop=True)
+        )
+
+        out["vitro_call_sum"] = (
+            invitro_df[
+                "vitro_call_sum"
+            ]
+            .reset_index(drop=True)
+        )
+
+    except Exception as exc:
+
+        print(
+            "[WARN] "
+            "in vitro ADを計算できませんでした:",
+            exc,
+        )
+
+        out["invitro_AD"] = pd.Series(
+            [pd.NA] * n,
+            dtype="boolean",
+        )
+
+        out["vitro_call_sum"] = np.nan
+
+    # ==================================================
+    # fold別予測をすべて保存
+    # ==================================================
+    out = pd.concat(
+        [
+            out.reset_index(drop=True),
+
+            knn_ad_fold
+            .add_prefix("knn_AD_")
+            .reset_index(drop=True),
+
+            pred_y_fold
+            .add_prefix("pred_y_")
+            .reset_index(drop=True),
+
+            pred_ec3_fold
+            .add_prefix(
+                "Predict_LLNA EC3_"
+            )
+            .reset_index(drop=True),
+        ],
+        axis=1,
+    )
+
+    out["pred_y_mean"] = (
+        pred_y_fold
+        .mean(
+            axis=1,
+            skipna=True,
+        )
+        .to_numpy()
+    )
+
+    out[
+        "Predict_LLNA EC3_mean"
+    ] = (
+        pred_ec3_fold
+        .mean(
+            axis=1,
+            skipna=True,
+        )
+        .to_numpy()
+    )
+
+    out["pred_y_max"] = (
+        pred_y_fold
+        .max(
+            axis=1,
+            skipna=True,
+        )
+        .to_numpy()
+    )
+
+    out[
+        "Predict_LLNA EC3_min"
+    ] = (
+        pred_ec3_fold
+        .min(
+            axis=1,
+            skipna=True,
+        )
+        .to_numpy()
+    )
+
+    return out
 
 
-def compute_ad_mask(
-    x_new_selected: np.ndarray,
-    x_train_selected: np.ndarray,
-    knn_k: int,
-    ad_coverage: float,
-) -> np.ndarray:
-    x_dist = cdist(x_train_selected, x_train_selected)
-    x_dist_sorted = np.sort(x_dist, axis=1)
-    knn_dist = np.mean(x_dist_sorted[:, 1 : knn_k + 1], axis=1)
-    knn_dist = np.sort(knn_dist)
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=(
+            "Notebook再現版 "
+            "XGBoost 学習スクリプト"
+        )
+    )
 
-    threshold_idx = round(x_train_selected.shape[0] * (1.0 - ad_coverage)) - 1
-    threshold_idx = max(0, min(threshold_idx, len(knn_dist) - 1))
-    ad_threshold = knn_dist[threshold_idx]
+    p.add_argument(
+        "--train-csv",
+        required=True,
+        help="DASS学習CSV",
+    )
 
-    x_new_dist = cdist(x_new_selected, x_train_selected)
-    x_new_dist_sorted = np.sort(x_new_dist, axis=1)
-    knn_dist_new = np.mean(x_new_dist_sorted[:, :knn_k], axis=1)
-    return knn_dist_new <= ad_threshold
+    p.add_argument(
+        "--exval-csv",
+        required=True,
+        help="newCE外部検証CSV",
+    )
+
+    p.add_argument(
+        "--target-col",
+        default=TARGET_COLUMN_DEFAULT,
+        help="目的変数列名",
+    )
+
+    p.add_argument(
+        "--artifact-path",
+        default=(
+            "artifacts/"
+            "original_model_artifact.joblib"
+        ),
+    )
+
+    p.add_argument(
+        "--output-dir",
+        default="outputs",
+    )
+
+    p.add_argument(
+        "--feature-mode",
+        choices=[
+            "boruta",
+            "fixed",
+        ],
+        default="boruta",
+        help=(
+            "boruta=Boruta再計算 / "
+            "fixed=Notebook固定特徴量"
+        ),
+    )
+
+    p.add_argument(
+        "--random-state",
+        type=int,
+        default=1037,
+    )
+
+    p.add_argument(
+        "--cv-folds",
+        type=int,
+        default=5,
+    )
+
+    p.add_argument(
+        "--parameter-tuning",
+        action="store_true",
+    )
+
+    p.add_argument(
+        "--n-trials",
+        type=int,
+        default=100,
+    )
+
+    p.add_argument(
+        "--boruta-rf-depth",
+        type=int,
+        default=5,
+    )
+
+    p.add_argument(
+        "--boruta-perc",
+        type=int,
+        default=100,
+    )
+
+    p.add_argument(
+        "--knn-neighbors",
+        type=int,
+        default=5,
+    )
+
+    p.add_argument(
+        "--knn-weights",
+        default="uniform",
+    )
+
+    p.add_argument(
+        "--ad-k",
+        type=int,
+        default=5,
+    )
+
+    p.add_argument(
+        "--ad-coverage",
+        type=float,
+        default=0.1,
+    )
+
+    p.add_argument(
+        "--save-force-plots",
+        action="store_true",
+    )
+
+    p.add_argument(
+        "--skip-shap",
+        action="store_true",
+    )
+
+    return p.parse_args()
 
 
-def build_artifact(
-    full_feature_columns: list[str],
-    selected_mask: np.ndarray,
-    folds: dict[str, Any],
-    config: dict[str, Any],
-) -> dict[str, Any]:
-    selected_feature_columns = [
-        c for c, flag in zip(full_feature_columns, selected_mask) if bool(flag)
+def main() -> None:
+
+    args = parse_args()
+
+    # ==================================================
+    # 引数チェック
+    # ==================================================
+    if args.cv_folds < 2:
+        raise ValueError(
+            "--cv-folds は2以上にしてください。"
+        )
+
+    if args.ad_k < 1:
+        raise ValueError(
+            "--ad-k は1以上にしてください。"
+        )
+
+    if not (
+        0.0 <= args.ad_coverage < 1.0
+    ):
+        raise ValueError(
+            "--ad-coverage は"
+            "0以上1未満にしてください。"
+        )
+
+    # ==================================================
+    # 出力ディレクトリ
+    # ==================================================
+    output_dir = Path(
+        args.output_dir
+    )
+
+    reports_dir = ensure_dir(
+        output_dir / "reports"
+    )
+
+    shap_dir = ensure_dir(
+        reports_dir / "SHAP"
+    )
+
+    shap_summary_dir = ensure_dir(
+        shap_dir / "summary_plot"
+    )
+
+    shap_force_dir = ensure_dir(
+        shap_dir / "force_plot"
+    )
+
+    pred_dir = ensure_dir(
+        output_dir / "prediction_report"
+    )
+
+    debug_dir = ensure_dir(
+        output_dir / "debug"
+    )
+
+    print(
+        "[INFO] train_csv:",
+        args.train_csv,
+    )
+
+    print(
+        "[INFO] exval_csv:",
+        args.exval_csv,
+    )
+
+    print(
+        "[INFO] aggregation:"
+        " minimum EC3 per row"
+    )
+
+    # ==================================================
+    # データ読込
+    # ==================================================
+    train_ds = load_dataset(
+        args.train_csv,
+        target_col=args.target_col,
+    )
+
+    exval_ds = load_dataset(
+        args.exval_csv,
+        target_col=args.target_col,
+    )
+
+    X_train_full: pd.DataFrame = (
+        train_ds[
+            "X_full"
+        ].copy()
+    )
+
+    X_exval_full: pd.DataFrame = (
+        exval_ds[
+            "X_full"
+        ].copy()
+    )
+
+    y_train_ec3 = pd.to_numeric(
+        train_ds["y_ec3"],
+        errors="coerce",
+    )
+
+    y_exval_ec3 = pd.to_numeric(
+        exval_ds["y_ec3"],
+        errors="coerce",
+    )
+
+    meta_train = (
+        train_ds[
+            "meta"
+        ].copy()
+    )
+
+    meta_exval = (
+        exval_ds[
+            "meta"
+        ].copy()
+    )
+
+    # ==================================================
+    # exval列を学習時と同じ順序にそろえる
+    # ==================================================
+    missing_exval_full = [
+        c
+        for c in X_train_full.columns
+        if c not in X_exval_full.columns
     ]
-    return {
-        "artifact_version": 1,
-        "source": {
-            "created_by": "train.py",
-            "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        },
-        "target": {
-            "raw_target_column": "LLNA_EC3",
-            "y_definition": "log10(MolWeight / EC3)",
-            "ec3_inverse_definition": "MolWeight / (10 ** y)",
-        },
-        "config": copy.deepcopy(config),
-        "xgboost_base_params": copy.deepcopy(DEFAULT_XGB_PARAMS),
-        "full_feature_columns": full_feature_columns,
-        "selected_feature_mask": selected_mask.tolist(),
-        "selected_feature_columns": selected_feature_columns,
-        "folds": folds,
-        "ad_config": {
-            "knn_k": config["AD_KNN_k"],
-            "AD_coverage": config["AD_coverage"],
-        },
-    }
 
+    if missing_exval_full:
+        raise KeyError(
+            "exval CSVに学習特徴量が"
+            f"不足しています: {missing_exval_full}"
+        )
 
-def train_and_export(args: argparse.Namespace) -> Path:
-    dass_df = read_project_csv(args.dass_csv, encoding=args.encoding)
-    _, dass_x_full, dass_ec3 = split_notebook_style(dass_df)
-
-    if "MolWeight" not in dass_x_full.columns:
-        raise ValueError("DASS の説明変数列に MolWeight がありません。")
-
-    exval_x_full = None
-    exval_ec3 = None
-    if args.exval_csv:
-        exval_df = read_project_csv(args.exval_csv, encoding=args.encoding)
-        exval_df = exval_df.dropna(subset=["MolWeight"], axis=0).reset_index(drop=True)
-        _, exval_x_full, exval_ec3 = split_notebook_style(exval_df)
-
-    y_data = convert_to_y(dass_ec3, dass_x_full["MolWeight"].values)
-    y_reconverted = convert_to_ec3(y_data, dass_x_full["MolWeight"].values)
-    y_label = np.array([llna_label(v, 2) for v in y_reconverted], dtype=int)
-    selected_mask = fit_global_boruta(
-        x_full=dass_x_full,
-        y_data=y_data,
-        boruta_perc=args.boruta_perc,
+    X_exval_full = (
+        X_exval_full
+        .loc[
+            :,
+            X_train_full.columns,
+        ]
+        .copy()
     )
 
-    # Notebook版と特徴量集合を一致させる
-    if "FM percent reacted" in dass_x_full.columns:
-        idx = list(dass_x_full.columns).index("FM percent reacted")
-        selected_mask[idx] = False
+    # ==================================================
+    # MolWeight検証
+    # ==================================================
+    mw_train = _validate_molecular_weight(
+        X_train_full,
+        dataset_name="train",
+    )
 
+    mw_exval = _validate_molecular_weight(
+        X_exval_full,
+        dataset_name="exval",
+    )
+
+    train_ec3_values = (
+        y_train_ec3
+        .to_numpy(dtype=float)
+    )
+
+    exval_ec3_values = (
+        y_exval_ec3
+        .to_numpy(dtype=float)
+    )
+
+    if (
+        ~np.isfinite(train_ec3_values)
+        | (train_ec3_values <= 0)
+    ).any():
+        raise ValueError(
+            "trainの目的変数EC3に"
+            "欠損・非数値・0以下があります。"
+        )
+
+    if (
+        ~np.isfinite(exval_ec3_values)
+        | (exval_ec3_values <= 0)
+    ).any():
+        raise ValueError(
+            "exvalの目的変数EC3に"
+            "欠損・非数値・0以下があります。"
+        )
+
+    # ==================================================
+    # EC3 -> y
+    # ==================================================
+    y_train = _as_1d_float(
+        convert_ec3_to_y(
+            y_train_ec3,
+            mw_train,
+        ),
+        name="y_train",
+        expected_len=len(
+            X_train_full
+        ),
+    )
+
+    y_exval = _as_1d_float(
+        convert_ec3_to_y(
+            y_exval_ec3,
+            mw_exval,
+        ),
+        name="y_exval",
+        expected_len=len(
+            X_exval_full
+        ),
+    )
+
+    debug_nan = {
+        "train_rows":
+            int(
+                len(X_train_full)
+            ),
+        "exval_rows":
+            int(
+                len(X_exval_full)
+            ),
+        "train_target_nan":
+            int(
+                pd.isna(
+                    y_train_ec3
+                ).sum()
+            ),
+        "exval_target_nan":
+            int(
+                pd.isna(
+                    y_exval_ec3
+                ).sum()
+            ),
+        "train_mw_nan":
+            int(
+                pd.isna(
+                    mw_train
+                ).sum()
+            ),
+        "exval_mw_nan":
+            int(
+                pd.isna(
+                    mw_exval
+                ).sum()
+            ),
+        "train_y_nan":
+            int(
+                np.isnan(
+                    y_train
+                ).sum()
+            ),
+        "exval_y_nan":
+            int(
+                np.isnan(
+                    y_exval
+                ).sum()
+            ),
+    }
+
+    save_json(
+        debug_nan,
+        debug_dir
+        / "nan_summary.json",
+    )
+
+    print(
+        "[DEBUG] nan_summary:",
+        json.dumps(
+            debug_nan,
+            ensure_ascii=False,
+        ),
+    )
+
+    # ==================================================
+    # StratifiedKFold用ラベル
+    # ==================================================
+    labels_train = make_llna_labels(
+        train_ec3_values,
+        boundary=2.0,
+    )
+
+    preprocess_pipeline = (
+        make_preprocess_pipeline(
+            n_neighbors=(
+                args.knn_neighbors
+            ),
+            weights=(
+                args.knn_weights
+            ),
+        )
+    )
+
+    # ==================================================
+    # 特徴量選択
+    # ==================================================
+    if args.feature_mode == "boruta":
+
+        (
+            selected_mask,
+            selected_columns,
+            _boruta,
+        ) = fit_global_boruta(
+            X_train_full,
+            y_train,
+            preprocess_pipeline,
+            rf_depth=(
+                args.boruta_rf_depth
+            ),
+            perc=(
+                args.boruta_perc
+            ),
+            random_state=0,
+        )
+
+        selected_columns = list(
+            selected_columns
+        )
+
+    else:
+
+        selected_columns = [
+            c
+            for c
+            in NOTEBOOK_SELECTED_FEATURE_COLUMNS
+            if c
+            in X_train_full.columns
+        ]
+
+    # Notebook互換
     selected_columns = [
-        c for c, flag in zip(dass_x_full.columns, selected_mask)
-        if bool(flag)
+        c
+        for c in selected_columns
+        if c
+        != "FM percent reacted"
     ]
 
-    print("\n=== Selected Features ===")
-    print(f"Count: {len(selected_columns)}")
-    for col in selected_columns:
-        print(col)
-    print("=========================\n")
-    
+    # 除外後にmaskを必ず作り直す
+    selected_set = set(
+        selected_columns
+    )
 
-    config = {
-        "Data_split_random_state": args.random_state,
-        "Preprocess_pipeline": "Pipeline(KNNImputer(n_neighbors=5, weights='uniform') + StandardScaler())",
-        "Feature_selection": True,
-        "Feature_selection_function": f"BorutaPy(RandomForestRegressor(max_depth=5), perc={args.boruta_perc}, random_state=0)",
-        "Parameter_tuning": True,
-        "CV_folds": args.cv_folds,
-        "AD_KNN_k": args.ad_knn_k,
-        "AD_coverage": args.ad_coverage,
-    }
+    selected_mask = np.array(
+        [
+            c in selected_set
+            for c
+            in X_train_full.columns
+        ],
+        dtype=bool,
+    )
 
-    outer_skf = StratifiedKFold(
+    if (
+        not selected_columns
+        or not selected_mask.any()
+    ):
+        raise ValueError(
+            "選択特徴量が0件です。"
+        )
+
+    if (
+        int(selected_mask.sum())
+        != len(selected_columns)
+    ):
+        raise ValueError(
+            "selected_feature_columns と "
+            "selected_feature_mask が"
+            "不整合です。"
+        )
+
+    pd.DataFrame(
+        {
+            "full_feature_columns":
+                X_train_full.columns,
+
+            "selected":
+                selected_mask.astype(int),
+        }
+    ).to_csv(
+        debug_dir
+        / "selected_features.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    print(
+        "[INFO] selected_feature_count:",
+        int(
+            selected_mask.sum()
+        ),
+    )
+
+    print(
+        "[INFO] selected_feature_columns:",
+        selected_columns,
+    )
+
+    # ==================================================
+    # CV
+    # ==================================================
+    skf = StratifiedKFold(
         n_splits=args.cv_folds,
         shuffle=True,
         random_state=args.random_state,
     )
 
-    folds: dict[str, Any] = {}
-    for fold_no, (tr_idx, te_idx) in enumerate(outer_skf.split(dass_x_full, y_label), start=1):
-        x_train_raw = dass_x_full.iloc[tr_idx, :]
-        x_test_raw = dass_x_full.iloc[te_idx, :]
+    base_params = deepcopy(
+        NOTEBOOK_XGB_BASE_PARAMS
+    )
 
-        y_train = y_data[tr_idx]
-        y_test = y_data[te_idx]
+    folds: list[dict] = []
 
-        y_train_ec3 = y_reconverted[tr_idx]
-        y_test_ec3 = y_reconverted[te_idx]
+    test_pred_y_all = np.full(
+        len(X_train_full),
+        np.nan,
+        dtype=float,
+    )
 
-        y_train_label = y_label[tr_idx]
-        y_test_label = y_label[te_idx]
+    test_pred_ec3_all = np.full(
+        len(X_train_full),
+        np.nan,
+        dtype=float,
+    )
 
-        mw_train = x_train_raw["MolWeight"].to_numpy()
-        mw_test = x_test_raw["MolWeight"].to_numpy()
+    test_ad_all = np.full(
+        len(X_train_full),
+        False,
+        dtype=bool,
+    )
 
-        pipe = make_pipeline()
-        x_train_pre = pipe.fit_transform(x_train_raw)
-        x_test_pre = pipe.transform(x_test_raw)
+    exval_pred_y_fold = pd.DataFrame(
+        index=X_exval_full.index
+    )
 
-        x_train_sel = np.asarray(x_train_pre)[:, selected_mask]
-        x_test_sel = np.asarray(x_test_pre)[:, selected_mask]
+    exval_pred_ec3_fold = pd.DataFrame(
+        index=X_exval_full.index
+    )
 
-        tune_result = optuna_tune_xgb(
-            x_train_selected=x_train_sel,
-            y_train=y_train,
-            y_train_label=y_train_label,
-            n_trials=args.n_trials,
+    exval_ad_fold = pd.DataFrame(
+        index=X_exval_full.index
+    )
+
+    exval_metrics_list: list[dict] = []
+
+    # ==================================================
+    # fold学習
+    # ==================================================
+    for fold_no, (
+        tr_idx,
+        te_idx,
+    ) in enumerate(
+        skf.split(
+            X_train_full,
+            labels_train,
+        ),
+        start=1,
+    ):
+
+        fold_name = (
+            f"fold_{fold_no}"
         )
-        best_params = tune_result["best_params"]
 
-        model = XGBRegressor(**best_params)
-        model.fit(x_train_sel, y_train)
+        print(
+            f"[TRAIN] {fold_name}: "
+            f"train={len(tr_idx)} "
+            f"test={len(te_idx)}"
+        )
 
-        feature_importance = pd.DataFrame(
-            list(model.feature_importances_),
-            index=dass_x_full.iloc[:, selected_mask].columns.tolist(),
-            columns=["importance"],
-        ).sort_values("importance", ascending=False)
+        X_cvtrain = (
+            X_train_full
+            .iloc[tr_idx]
+            .copy()
+        )
 
-        fold_dict: dict[str, Any] = {
-            "pipeline": pipe,
-            "best_params": copy.deepcopy(best_params),
-            "model": model,
-            "feature_importance": feature_importance,
-            "train_selected_X": x_train_sel,
-            "train_indices": tr_idx,
-            "test_indices": te_idx,
-            "metrics": {
-                "train_r2": float(r2_score(y_train, model.predict(x_train_sel))),
-                "test_r2": float(r2_score(y_test, model.predict(x_test_sel))),
-                "train_rmse": float(math.sqrt(mean_squared_error(y_train, model.predict(x_train_sel)))),
-                "test_rmse": float(math.sqrt(mean_squared_error(y_test, model.predict(x_test_sel)))),
-            },
-            "targets": {
-                "y_train": y_train,
-                "y_test": y_test,
-                "ec3_train": y_train_ec3,
-                "ec3_test": y_test_ec3,
-                "label_train": y_train_label,
-                "label_test": y_test_label,
-                "mw_train": mw_train,
-                "mw_test": mw_test,
-            },
+        X_cvtest = (
+            X_train_full
+            .iloc[te_idx]
+            .copy()
+        )
+
+        y_cvtrain = (
+            y_train[tr_idx]
+        )
+
+        y_cvtest = (
+            y_train[te_idx]
+        )
+
+        labels_cvtrain = (
+            labels_train[tr_idx]
+        )
+
+        mw_cvtrain = (
+            mw_train[tr_idx]
+        )
+
+        mw_cvtest = (
+            mw_train[te_idx]
+        )
+
+        # ==============================================
+        # 非常に重要
+        # 1 foldにつきpipelineは1回だけfit
+        # 同じpipeでtest/exvalをtransform
+        # ==============================================
+        (
+            X_tr_pre,
+            X_te_pre,
+            pipe,
+        ) = clone_and_transform(
+            preprocess_pipeline,
+            X_cvtrain,
+            X_cvtest,
+        )
+
+        X_ex_pre = pipe.transform(
+            X_exval_full
+        )
+
+        X_tr_sel = (
+            np.asarray(
+                X_tr_pre,
+                dtype=float,
+            )[:, selected_mask]
+        )
+
+        X_te_sel = (
+            np.asarray(
+                X_te_pre,
+                dtype=float,
+            )[:, selected_mask]
+        )
+
+        X_ex_sel = (
+            np.asarray(
+                X_ex_pre,
+                dtype=float,
+            )[:, selected_mask]
+        )
+
+        # ==============================================
+        # Parameter tuning
+        # ==============================================
+        if args.parameter_tuning:
+
+            (
+                best_params,
+                study,
+                _best_iters,
+                best_n_estimators,
+            ) = optimize_xgb_params(
+                X_tr_sel,
+                y_cvtrain,
+                labels_cvtrain,
+                base_params=base_params,
+                n_trials=args.n_trials,
+                random_state=0,
+            )
+
+            study_best_value = float(
+                study.best_value
+            )
+
+            study_best_trial = int(
+                study.best_trial.number
+            )
+
+        else:
+
+            best_params = deepcopy(
+                base_params
+            )
+
+            best_params[
+                "n_estimators"
+            ] = 150
+
+            best_params.pop(
+                "early_stopping_rounds",
+                None,
+            )
+
+            best_n_estimators = 150
+
+            study_best_value = float(
+                "nan"
+            )
+
+            study_best_trial = -1
+
+        # ==============================================
+        # モデル学習
+        # ==============================================
+        model = _fit_model(
+            best_params,
+            X_tr_sel,
+            y_cvtrain,
+        )
+
+        # ==============================================
+        # y予測
+        # ==============================================
+        pred_tr_y = _as_1d_float(
+            model.predict(
+                X_tr_sel
+            ),
+            name=(
+                f"{fold_name}."
+                "pred_tr_y"
+            ),
+            expected_len=len(
+                tr_idx
+            ),
+        )
+
+        pred_te_y = _as_1d_float(
+            model.predict(
+                X_te_sel
+            ),
+            name=(
+                f"{fold_name}."
+                "pred_te_y"
+            ),
+            expected_len=len(
+                te_idx
+            ),
+        )
+
+        pred_ev_y = _as_1d_float(
+            model.predict(
+                X_ex_sel
+            ),
+            name=(
+                f"{fold_name}."
+                "pred_ev_y"
+            ),
+            expected_len=len(
+                X_exval_full
+            ),
+        )
+
+        # ==============================================
+        # y -> EC3
+        # ==============================================
+        pred_tr_ec3 = _as_1d_float(
+            convert_y_to_ec3(
+                pred_tr_y,
+                mw_cvtrain,
+            ),
+            name=(
+                f"{fold_name}."
+                "pred_tr_ec3"
+            ),
+            expected_len=len(
+                tr_idx
+            ),
+        )
+
+        pred_te_ec3 = _as_1d_float(
+            convert_y_to_ec3(
+                pred_te_y,
+                mw_cvtest,
+            ),
+            name=(
+                f"{fold_name}."
+                "pred_te_ec3"
+            ),
+            expected_len=len(
+                te_idx
+            ),
+        )
+
+        pred_ev_ec3 = _as_1d_float(
+            convert_y_to_ec3(
+                pred_ev_y,
+                mw_exval,
+            ),
+            name=(
+                f"{fold_name}."
+                "pred_ev_ec3"
+            ),
+            expected_len=len(
+                X_exval_full
+            ),
+        )
+
+        if (
+            ~np.isfinite(
+                pred_ev_ec3
+            )
+            | (
+                pred_ev_ec3 <= 0
+            )
+        ).all():
+
+            raise ValueError(
+                f"{fold_name}: "
+                "外部検証EC3が"
+                "全件無効です。"
+            )
+
+        # ==============================================
+        # AD
+        # ==============================================
+        (
+            y_test_ad,
+            y_test_knn_dist,
+            ad_threshold,
+        ) = compute_knn_ad(
+            X_tr_sel,
+            X_te_sel,
+            knn_k=args.ad_k,
+            coverage=args.ad_coverage,
+        )
+
+        (
+            y_exval_ad,
+            y_ex_knn_dist,
+            _,
+        ) = compute_knn_ad(
+            X_tr_sel,
+            X_ex_sel,
+            knn_k=args.ad_k,
+            coverage=args.ad_coverage,
+        )
+
+        y_test_ad = np.asarray(
+            y_test_ad,
+            dtype=bool,
+        ).reshape(-1)
+
+        y_exval_ad = np.asarray(
+            y_exval_ad,
+            dtype=bool,
+        ).reshape(-1)
+
+        # CV testは各行1つのheld-out fold
+        test_pred_y_all[
+            te_idx
+        ] = pred_te_y
+
+        test_pred_ec3_all[
+            te_idx
+        ] = pred_te_ec3
+
+        test_ad_all[
+            te_idx
+        ] = y_test_ad
+
+        # 外部検証は全fold保持
+        exval_pred_y_fold[
+            fold_name
+        ] = pred_ev_y
+
+        exval_pred_ec3_fold[
+            fold_name
+        ] = pred_ev_ec3
+
+        exval_ad_fold[
+            fold_name
+        ] = y_exval_ad
+
+        # ==============================================
+        # SHAP
+        # ==============================================
+        shap_paths: dict = {}
+
+        if not args.skip_shap:
+
+            try:
+                shap_paths = (
+                    save_shap_artifacts_for_fold(
+                        model,
+                        X_tr_sel,
+                        selected_columns,
+                        fold_name=fold_name,
+                        output_dir=(
+                            shap_summary_dir
+                        ),
+                        save_force=False,
+                    )
+                )
+
+                if args.save_force_plots:
+
+                    force_paths = (
+                        save_shap_artifacts_for_fold(
+                            model,
+                            X_tr_sel,
+                            selected_columns,
+                            fold_name=fold_name,
+                            output_dir=(
+                                shap_force_dir
+                            ),
+                            save_force=True,
+                        )
+                    )
+
+                    if force_paths.get(
+                        "force_plot_html"
+                    ):
+                        shap_paths[
+                            "force_plot_html"
+                        ] = force_paths[
+                            "force_plot_html"
+                        ]
+
+            except Exception as exc:
+
+                print(
+                    f"[WARN] {fold_name}: "
+                    "SHAP保存に失敗:",
+                    exc,
+                )
+
+                shap_paths = {
+                    "error": str(exc)
+                }
+
+        # ==============================================
+        # metrics
+        # ==============================================
+        train_metrics = (
+            valid_regression_metrics(
+                y_cvtrain,
+                pred_tr_y,
+            )
+        )
+
+        test_metrics = (
+            valid_regression_metrics(
+                y_cvtest,
+                pred_te_y,
+            )
+        )
+
+        exval_metrics = (
+            valid_regression_metrics(
+                y_exval,
+                pred_ev_y,
+            )
+        )
+
+        exval_metrics_list.append(
+            exval_metrics
+        )
+
+        # ==============================================
+        # artifact fold
+        # ==============================================
+        fold_artifact = {
+            "fold_name":
+                fold_name,
+
+            "train_index":
+                tr_idx.tolist(),
+
+            "test_index":
+                te_idx.tolist(),
+
+            "pipeline":
+                pipe,
+
+            "model":
+                model,
+
+            "best_params":
+                best_params,
+
+            "parameter_tuning":
+                bool(
+                    args.parameter_tuning
+                ),
+
+            "optuna_best_value":
+                study_best_value,
+
+            "optuna_best_trial_number":
+                study_best_trial,
+
+            "best_n_estimators":
+                int(
+                    best_n_estimators
+                ),
+
+            "selected_feature_columns":
+                list(
+                    selected_columns
+                ),
+
+            "selected_feature_mask":
+                selected_mask.tolist(),
+
+            "X_train_selected":
+                X_tr_sel,
+
+            "train_metrics":
+                train_metrics,
+
+            "test_metrics":
+                test_metrics,
+
+            "exval_metrics":
+                exval_metrics,
+
+            "ad_threshold":
+                float(
+                    ad_threshold
+                ),
+
+            "ad_knn_k":
+                int(
+                    args.ad_k
+                ),
+
+            "ad_coverage":
+                float(
+                    args.ad_coverage
+                ),
+
+            "test_knn_dist":
+                np.asarray(
+                    y_test_knn_dist,
+                    dtype=float,
+                )
+                .reshape(-1)
+                .tolist(),
+
+            "exval_knn_dist":
+                np.asarray(
+                    y_ex_knn_dist,
+                    dtype=float,
+                )
+                .reshape(-1)
+                .tolist(),
+
+            "shap_paths":
+                shap_paths,
         }
 
-        if exval_x_full is not None and exval_ec3 is not None:
-            x_exval_pre = pipe.transform(exval_x_full)
-            x_exval_sel = np.asarray(x_exval_pre)[:, selected_mask]
-            y_exval = convert_to_y(exval_ec3, exval_x_full["MolWeight"].values)
+        folds.append(
+            fold_artifact
+        )
 
-            pred_exval_y = model.predict(x_exval_sel)
-            pred_exval_ec3 = convert_to_ec3(pred_exval_y, exval_x_full["MolWeight"].values)
-            ad_mask = compute_ad_mask(
-                x_new_selected=x_exval_sel,
-                x_train_selected=x_train_sel,
-                knn_k=args.ad_knn_k,
-                ad_coverage=args.ad_coverage,
-            )
+    # ==================================================
+    # CV予測欠損チェック
+    # ==================================================
+    if (
+        np.isnan(
+            test_pred_y_all
+        ).any()
+        or
+        np.isnan(
+            test_pred_ec3_all
+        ).any()
+    ):
+        raise RuntimeError(
+            "CVテスト予測に"
+            "未代入行があります。"
+        )
 
-            fold_dict["exval"] = {
-                "pred_y": pred_exval_y,
-                "pred_ec3": pred_exval_ec3,
-                "true_y": y_exval,
-                "true_ec3": exval_ec3.to_numpy(),
-                "ad": ad_mask,
-            }
-
-        folds[f"fold_{fold_no}"] = fold_dict
-
-        if args.save_shap:
-            selected_columns = dass_x_full.iloc[:, selected_mask].columns.tolist()
-            explainer = shap.TreeExplainer(model)
-            shap_values = explainer.shap_values(x_train_sel)
-
-            shap_dir = Path(args.output_dir) / "SHAP" / "summary_plot"
-            shap_dir.mkdir(parents=True, exist_ok=True)
-
-            plt.figure()
-            shap.summary_plot(
-                shap_values,
-                x_train_sel,
-                feature_names=selected_columns,
-                plot_type="violin",
-                max_display=len(selected_columns),
-                show=False,
-            )
-            plt.savefig(shap_dir / f"summary_plot_fold_{fold_no}.jpg", bbox_inches="tight")
-            plt.close()
-
-    artifact = build_artifact(
-        full_feature_columns=list(dass_x_full.columns),
-        selected_mask=selected_mask,
-        folds=folds,
-        config=config,
+    # ==================================================
+    # DASS出力
+    # held-out foldをそのまま使用
+    # ==================================================
+    test_output_df = (
+        build_notebook_style_test_output(
+            meta_df=meta_train,
+            y_true=y_train,
+            y_true_ec3=(
+                train_ec3_values
+            ),
+            pred_y=(
+                test_pred_y_all
+            ),
+            pred_ec3=(
+                test_pred_ec3_all
+            ),
+            knn_ad=(
+                test_ad_all
+            ),
+            X_original=(
+                X_train_full
+            ),
+        )
     )
 
-    artifact_path = Path(args.artifact_path)
-    artifact_path.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(artifact, artifact_path, compress=3)
-    return artifact_path
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dass_csv", required=True, help="Notebookで使った DASS CSV")
-    parser.add_argument(
-        "--exval_csv",
-        default=None,
-        help="Notebookで使った newCE CSV。未指定なら外部検証予測はスキップ。",
+    # ==================================================
+    # newCE出力
+    # EC3最小foldを行ごとに選択
+    # ==================================================
+    exval_output_df = (
+        _build_min_ec3_exval_output(
+            meta_df=meta_exval,
+            y_true=y_exval,
+            y_true_ec3=(
+                exval_ec3_values
+            ),
+            pred_y_fold=(
+                exval_pred_y_fold
+            ),
+            pred_ec3_fold=(
+                exval_pred_ec3_fold
+            ),
+            knn_ad_fold=(
+                exval_ad_fold
+            ),
+            X_original=(
+                X_exval_full
+            ),
+        )
     )
-    parser.add_argument(
-        "--artifact_path",
-        default="artifacts/original_model_artifact.joblib",
-        help="保存先 joblib",
+
+    # ==================================================
+    # CSV出力
+    # ==================================================
+    test_output_path = (
+        pred_dir
+        / "DASS_predict_result_reproduced.csv"
     )
-    parser.add_argument("--output_dir", default="reports")
-    parser.add_argument("--encoding", default="cp932")
-    parser.add_argument("--random_state", type=int, default=1037)
-    parser.add_argument("--cv_folds", type=int, default=5)
-    parser.add_argument("--boruta_perc", type=int, default=100)
-    parser.add_argument("--n_trials", type=int, default=1000)
-    parser.add_argument("--ad_knn_k", type=int, default=5)
-    parser.add_argument("--ad_coverage", type=float, default=0.0)
-    parser.add_argument("--save_shap", action="store_true")
-    return parser.parse_args()
+
+    exval_output_path = (
+        pred_dir
+        / "newCE_predict_result_reproduced.csv"
+    )
+
+    test_output_df.to_csv(
+        test_output_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    exval_output_df.to_csv(
+        exval_output_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    # ==================================================
+    # foldごとの前処理後データ
+    # ==================================================
+    train_data_dir = ensure_dir(
+        output_dir
+        / "train_test_data"
+    )
+
+    exval_data_dir = ensure_dir(
+        output_dir
+        / "exval_data"
+    )
+
+    for fold in folds:
+
+        fold_name = (
+            fold["fold_name"]
+        )
+
+        tr_idx = (
+            fold["train_index"]
+        )
+
+        te_idx = (
+            fold["test_index"]
+        )
+
+        selected_cols = (
+            fold[
+                "selected_feature_columns"
+            ]
+        )
+
+        pipe = (
+            fold["pipeline"]
+        )
+
+        fold_mask = np.asarray(
+            fold[
+                "selected_feature_mask"
+            ],
+            dtype=bool,
+        )
+
+        X_fold_train_pre = (
+            np.asarray(
+                pipe.transform(
+                    X_train_full.iloc[
+                        tr_idx
+                    ]
+                ),
+                dtype=float,
+            )[:, fold_mask]
+        )
+
+        X_fold_test_pre = (
+            np.asarray(
+                pipe.transform(
+                    X_train_full.iloc[
+                        te_idx
+                    ]
+                ),
+                dtype=float,
+            )[:, fold_mask]
+        )
+
+        X_fold_exval_pre = (
+            np.asarray(
+                pipe.transform(
+                    X_exval_full
+                ),
+                dtype=float,
+            )[:, fold_mask]
+        )
+
+        df_train_fold = pd.concat(
+            [
+                meta_train
+                .iloc[tr_idx]
+                .reset_index(
+                    drop=True
+                ),
+
+                pd.DataFrame(
+                    X_fold_train_pre,
+                    columns=selected_cols,
+                ),
+            ],
+            axis=1,
+        )
+
+        df_test_fold = pd.concat(
+            [
+                meta_train
+                .iloc[te_idx]
+                .reset_index(
+                    drop=True
+                ),
+
+                pd.DataFrame(
+                    X_fold_test_pre,
+                    columns=selected_cols,
+                ),
+            ],
+            axis=1,
+        )
+
+        pd.concat(
+            [
+                df_train_fold,
+                df_test_fold,
+            ],
+            ignore_index=True,
+        ).to_csv(
+            train_data_dir
+            / (
+                "train_test_data_"
+                f"{fold_name}.csv"
+            ),
+            index=False,
+            encoding="utf-8-sig",
+        )
+
+        pd.concat(
+            [
+                meta_exval
+                .reset_index(
+                    drop=True
+                ),
+
+                pd.DataFrame(
+                    X_fold_exval_pre,
+                    columns=selected_cols,
+                ),
+            ],
+            axis=1,
+        ).to_csv(
+            exval_data_dir
+            / (
+                "exval_data_"
+                f"{fold_name}.csv"
+            ),
+            index=False,
+            encoding="utf-8-sig",
+        )
+
+    # ==================================================
+    # Aggregate metrics
+    # ==================================================
+    aggregate_metrics = {
+
+        "aggregation_rule":
+            "minimum_predicted_ec3_per_row",
+
+        "test_overall":
+            valid_regression_metrics(
+                y_train,
+                test_pred_y_all,
+            ),
+
+        "exval_overall_allfold_no_ad":
+            valid_regression_metrics(
+                y_exval,
+                exval_output_df[
+                    "pred_y"
+                ].to_numpy(
+                    dtype=float
+                ),
+            ),
+
+        "exval_overall_knn_inad":
+            valid_regression_metrics(
+                y_exval,
+                exval_output_df[
+                    "knn_inAD_pred_y"
+                ].to_numpy(
+                    dtype=float
+                ),
+            ),
+
+        "fold_exval_metrics":
+            exval_metrics_list,
+    }
+
+    save_json(
+        aggregate_metrics,
+        reports_dir
+        / "metrics.json",
+    )
+
+    # ==================================================
+    # artifact保存
+    # ==================================================
+    artifact = {
+
+        "artifact_version":
+            "repro_v2_min_ec3",
+
+        "source":
+            (
+                "XGBoost_model_refact_tokunaga "
+                "Notebook + corrected train.py"
+            ),
+
+        "target":
+            args.target_col,
+
+        "prediction_aggregation":
+            "minimum_predicted_ec3_per_row",
+
+        "config": {
+            "random_state":
+                args.random_state,
+
+            "cv_folds":
+                args.cv_folds,
+
+            "parameter_tuning":
+                bool(
+                    args.parameter_tuning
+                ),
+
+            "n_trials":
+                int(
+                    args.n_trials
+                ),
+
+            "feature_mode":
+                args.feature_mode,
+
+            "boruta_rf_depth":
+                args.boruta_rf_depth,
+
+            "boruta_perc":
+                args.boruta_perc,
+
+            "knn_neighbors":
+                args.knn_neighbors,
+
+            "knn_weights":
+                args.knn_weights,
+
+            "ad_k":
+                args.ad_k,
+
+            "ad_coverage":
+                args.ad_coverage,
+        },
+
+        "xgboost_base_params":
+            base_params,
+
+        "full_feature_columns":
+            X_train_full.columns.tolist(),
+
+        "selected_feature_mask":
+            selected_mask.tolist(),
+
+        "selected_feature_columns":
+            list(
+                selected_columns
+            ),
+
+        # Streamlit/runtime側で
+        # MolWeightを必須にできる
+        "runtime_required_columns":
+            list(
+                dict.fromkeys(
+                    [
+                        MW_COL,
+                        *selected_columns,
+                    ]
+                )
+            ),
+
+        "notebook_selected_feature_columns":
+            list(
+                NOTEBOOK_SELECTED_FEATURE_COLUMNS
+            ),
+
+        "folds":
+            folds,
+
+        "ad_config": {
+            "knn_k":
+                args.ad_k,
+
+            "coverage":
+                args.ad_coverage,
+        },
+
+        "train_csv":
+            os.path.abspath(
+                args.train_csv
+            ),
+
+        "exval_csv":
+            os.path.abspath(
+                args.exval_csv
+            ),
+
+        "train_output_csv":
+            str(
+                test_output_path
+            ),
+
+        "exval_output_csv":
+            str(
+                exval_output_path
+            ),
+
+        "metrics":
+            aggregate_metrics,
+    }
+
+    artifact_path = Path(
+        args.artifact_path
+    )
+
+    ensure_dir(
+        artifact_path.parent
+    )
+
+    joblib.dump(
+        artifact,
+        artifact_path,
+    )
+
+    print(
+        "[DONE] artifact saved:",
+        artifact_path,
+    )
+
+    print(
+        "[DONE] test_output:",
+        test_output_path,
+    )
+
+    print(
+        "[DONE] exval_output:",
+        exval_output_path,
+    )
+
+    print(
+        "[DONE] representative prediction"
+        " = minimum EC3 fold per row"
+    )
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    saved = train_and_export(args)
-    print(f"saved: {saved}")
+    main()
